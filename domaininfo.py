@@ -305,14 +305,13 @@ def get_hosting_info(ip: str) -> Optional[str]:
         result = subprocess.run(
             ['whois', ip],
             capture_output=True,
-            text=True,
             timeout=10
         )
 
         if result.returncode != 0:
             return None
 
-        whois_output = result.stdout
+        whois_output = result.stdout.decode('utf-8', errors='ignore')
 
         for pattern in WHOIS_ORG_PATTERNS:
             match = pattern.search(whois_output)
@@ -460,10 +459,10 @@ def main():
     for domain in all_domains:
         cleaned = clean_domain(domain)
         if not is_valid_domain(cleaned):
-            print(f"Error: '{domain}' is not a valid domain name.", file=sys.stderr)
-            print("Usage: domain-hosting-lookup.py <domain>", file=sys.stderr)
-            print("Example: domain-hosting-lookup.py example.com", file=sys.stderr)
-            sys.exit(1)
+                        print(f"Error: '{domain}' is not a valid domain name.", file=sys.stderr)
+                        print("Usage: domaininfo.py <domain>", file=sys.stderr)
+                        print("Example: domaininfo.py example.com", file=sys.stderr)
+                        sys.exit(1)
 
     # Single Mode: 1 domain AND no output file specified
     if len(all_domains) == 1 and not args.output:
