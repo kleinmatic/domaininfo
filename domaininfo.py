@@ -11,9 +11,11 @@ import subprocess
 import re
 import argparse
 import csv
+import json
 import concurrent.futures
 import urllib.request
 import urllib.error
+import urllib.parse
 from typing import Dict, Optional
 
 
@@ -118,7 +120,7 @@ def is_valid_domain(domain: str) -> bool:
     return True
 
 
-def check_redirect(domain: str) -> Optional[str]:
+def check_redirect(domain: str, timeout: int = 10) -> Optional[str]:
     """
     Check if the domain redirects (3xx) to a *different* domain.
     Returns the target URL if it redirects to a different domain, otherwise None.
@@ -135,7 +137,7 @@ def check_redirect(domain: str) -> Optional[str]:
             def redirect_request(self, req, fp, code, msg, headers, newurl):
                 return None
         opener = urllib.request.build_opener(NoRedirect)
-        opener.open(req, timeout=5)
+        opener.open(req, timeout=timeout)
         return None
     except urllib.error.HTTPError as e:
         if 300 <= e.code < 400:
@@ -329,13 +331,28 @@ def get_hosting_info(ip: str) -> Optional[str]:
         return None
 
 
-def analyze_domain(raw_input: str) -> Dict:
+def analyze_domain(raw_input: str, check_redirects: bool = True, timeout: int = 10, verbose: bool = False) -> Dict:
     """
     Perform full analysis on a domain.
     Returns a dictionary with the results.
     """
     # 1. Clean the input to get the Hostname (used for IP/Hosting)
     hostname = clean_domain(raw_input)
+    
+    # Validate domain
+    if not is_valid_domain(hostname):
+        return {
+            'original_input': raw_input,
+            'hostname': hostname,
+            'root_domain': '',
+            'redirect_target': None,
+            'ip': None,
+            'nameserver': None,
+            'registrar': None,
+            'hosting': None,
+            'is_cdn': False,
+            'error': f"Invalid domain name: '{hostname}'"
+        }
     
     # 2. Extract the Root Domain (used for Registrar/NS)
     root_domain = get_registered_domain(hostname)
@@ -354,9 +371,14 @@ def analyze_domain(raw_input: str) -> Dict:
     }
 
     # Check for redirects
-    result['redirect_target'] = check_redirect(hostname)
+    if check_redirects:
+        if verbose:
+            print(f"[VERBOSE] Checking redirects for {hostname}...", file=sys.stderr)
+        result['redirect_target'] = check_redirect(hostname, timeout=timeout)
 
     # Get IP address (uses Hostname)
+    if verbose:
+        print(f"[VERBOSE] Resolving IP for {hostname}...", file=sys.stderr)
     ip = get_ip_address(hostname)
     if not ip:
         result['error'] = f"Could not resolve domain '{hostname}'"
@@ -365,12 +387,18 @@ def analyze_domain(raw_input: str) -> Dict:
     result['ip'] = ip
 
     # Get nameserver info (uses Root Domain)
+    if verbose:
+        print(f"[VERBOSE] Running: dig +short NS {root_domain}", file=sys.stderr)
     result['nameserver'] = get_nameserver_info(root_domain)
 
     # Get registrar info (uses Root Domain)
+    if verbose:
+        print(f"[VERBOSE] Running: whois {root_domain}", file=sys.stderr)
     result['registrar'] = get_registrar_info(root_domain)
 
     # Get hosting info from WHOIS (uses IP)
+    if verbose:
+        print(f"[VERBOSE] Running: whois {ip}", file=sys.stderr)
     hosting = get_hosting_info(ip)
     if hosting:
         result['hosting'] = hosting
@@ -418,6 +446,10 @@ def main():
     parser.add_argument('--input', '-i', help='Input file with list of domains (one per line)')
     parser.add_argument('--output', '-o', help='Output CSV file (default: stdout for multiple domains)')
     parser.add_argument('--threads', '-t', type=int, default=10, help='Number of concurrent threads for bulk lookup')
+    parser.add_argument('--json', '-j', action='store_true', help='Output in JSON format')
+    parser.add_argument('--check-redirects', action='store_true', help='Check for HTTP redirects (adds latency)')
+    parser.add_argument('--timeout', type=int, default=10, help='Timeout in seconds for network operations (default: 10)')
+    parser.add_argument('--verbose', '-v', action='store_true', help='Show verbose output with commands being executed')
 
     args = parser.parse_args()
 
@@ -455,67 +487,102 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    # Validate domains before processing
-    for domain in all_domains:
-        cleaned = clean_domain(domain)
+    # Single Mode: 1 domain AND no output file specified AND not JSON mode
+    if len(all_domains) == 1 and not args.output and not args.json:
+        # Validate single domain strictly (exit on error)
+        cleaned = clean_domain(all_domains[0])
         if not is_valid_domain(cleaned):
-                        print(f"Error: '{domain}' is not a valid domain name.", file=sys.stderr)
-                        print("Usage: domaininfo.py <domain>", file=sys.stderr)
-                        print("Example: domaininfo.py example.com", file=sys.stderr)
-                        sys.exit(1)
-
-    # Single Mode: 1 domain AND no output file specified
-    if len(all_domains) == 1 and not args.output:
-        data = analyze_domain(all_domains[0])
+            print(f"Error: '{all_domains[0]}' is not a valid domain name.", file=sys.stderr)
+            print("Usage: domaininfo.py <domain>", file=sys.stderr)
+            print("Example: domaininfo.py example.com", file=sys.stderr)
+            sys.exit(1)
+        
+        data = analyze_domain(
+            all_domains[0],
+            check_redirects=args.check_redirects,
+            timeout=args.timeout,
+            verbose=args.verbose
+        )
         print_single_report(data)
         sys.exit(0)
 
-    # Bulk Mode
-    # If we are here, we have > 1 domain OR an output file was specified
+    # Bulk Mode (or JSON mode)
+    # If we are here, we have > 1 domain OR an output file was specified OR JSON mode
     
     fieldnames = ['hostname', 'root_domain', 'redirect_target', 'ip', 'nameserver', 'registrar', 'hosting', 'is_cdn', 'error']
     
-    # Setup output stream
-    if args.output:
-        f_out = open(args.output, 'w', newline='')
-        show_progress = True
-    else:
-        f_out = sys.stdout
-        show_progress = False
+    # Show progress if outputting to file OR if piping to stdout (not a tty)
+    show_progress = args.output is not None or not sys.stdout.isatty()
+    
+    if show_progress and args.verbose:
+        print(f"Processing {len(all_domains)} domains with {args.threads} threads...", file=sys.stderr)
 
-    try:
-        writer = csv.DictWriter(f_out, fieldnames=fieldnames)
-        writer.writeheader()
-        f_out.flush()
-
-        if show_progress:
-            print(f"Processing {len(all_domains)} domains with {args.threads} threads...", file=sys.stderr)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
-            future_to_domain = {executor.submit(analyze_domain, domain): domain for domain in all_domains}
+    # Process all domains
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as executor:
+        future_to_domain = {
+            executor.submit(
+                analyze_domain,
+                domain,
+                check_redirects=args.check_redirects,
+                timeout=args.timeout,
+                verbose=args.verbose
+            ): domain for domain in all_domains
+        }
+        
+        completed = 0
+        for future in concurrent.futures.as_completed(future_to_domain):
+            data = future.result()
+            results.append(data)
             
-            completed = 0
-            for future in concurrent.futures.as_completed(future_to_domain):
-                data = future.result()
-                
-                # Write row immediately
+            completed += 1
+            if show_progress:
+                print(f"\rProgress: {completed}/{len(all_domains)}", end="", file=sys.stderr, flush=True)
+    
+    if show_progress:
+        print("", file=sys.stderr)  # New line after progress
+    
+    # Output results
+    if args.json:
+        # JSON output
+        output_data = json.dumps(results, indent=2)
+        if args.output:
+            try:
+                with open(args.output, 'w') as f:
+                    f.write(output_data)
+                if show_progress:
+                    print(f"Done! Report saved to {args.output}", file=sys.stderr)
+            except IOError as e:
+                print(f"Error writing to file: {e}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            print(output_data)
+    else:
+        # CSV output
+        if args.output:
+            f_out = open(args.output, 'w', newline='')
+        else:
+            f_out = sys.stdout
+
+        try:
+            writer = csv.DictWriter(f_out, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            for data in results:
                 row = {k: v for k, v in data.items() if k in fieldnames}
                 writer.writerow(row)
-                f_out.flush()
-                
-                completed += 1
-                if show_progress:
-                    print(f"\rProgress: {completed}/{len(all_domains)}", end="", file=sys.stderr, flush=True)
-        
-        if show_progress:
-            print(f"\nDone! Report saved to {args.output}", file=sys.stderr)
+            
+            f_out.flush()
+            
+            if args.output and show_progress:
+                print(f"Done! Report saved to {args.output}", file=sys.stderr)
 
-    except IOError as e:
-        print(f"Error writing to CSV: {e}", file=sys.stderr)
-        sys.exit(1)
-    finally:
-        if args.output and f_out:
-            f_out.close()
+        except IOError as e:
+            print(f"Error writing to CSV: {e}", file=sys.stderr)
+            sys.exit(1)
+        finally:
+            if args.output and f_out:
+                f_out.close()
 
 
 if __name__ == '__main__':
